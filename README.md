@@ -20,7 +20,18 @@ This small project demonstrates:
     The API will be available at http://127.0.0.1:6000
 
 4. Example request:
-    curl -X POST http://127.0.0.1:6000/predict -H "Content-Type: application/json" -d '{"text":"I want to cancel my subscription"}'
+
+    PowerShell:
+
+    ```powershell
+    Invoke-RestMethod -Uri "http://127.0.0.1:6000/predict" -Method Post -ContentType "application/json" -Body '{"text":"I want to cancel my subscription"}'
+    ```
+
+    Command Prompt:
+
+    ```cmd
+    curl.exe -X POST http://127.0.0.1:6000/predict -H "Content-Type: application/json" -d "{\"text\":\"I want to cancel my subscription\"}"
+    ```
 
     Response:
     {
