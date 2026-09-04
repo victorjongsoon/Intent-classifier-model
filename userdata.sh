@@ -19,8 +19,8 @@ fi
 
 export APP_DIR=/opt/intent-app
 
-apt update -y
-apt install -y git python3 python3-venv python3-pip nginx
+apt-get -o Acquire::Retries=5 update
+apt-get -o Acquire::Retries=5 install -y git python3 python3-venv python3-pip nginx
 
 if [ -d "$APP_DIR/.git" ]; then
   git -c safe.directory="$APP_DIR" -C "$APP_DIR" remote set-url origin https://github.com/victorjongsoon/Intent-classifier-model.git

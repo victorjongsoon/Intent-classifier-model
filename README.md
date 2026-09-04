@@ -99,6 +99,8 @@ git switch --track origin/virtual-machines
 
 `userdata.sh` performs the production setup: it installs system packages, deploys the `virtual-machines` branch to `/opt/intent-app`, creates the Python virtual environment, installs dependencies, trains the model, and configures Gunicorn and Nginx as systemd services.
 
+The APT commands use `Acquire::Retries=5`. This protects first-boot provisioning from temporary Ubuntu package-mirror errors such as `503 Service Unavailable`. If all attempts fail, `set -euo pipefail` stops the script instead of continuing with a partially configured server.
+
 Make the script executable and run it as root:
 
 ```bash
@@ -188,9 +190,17 @@ These requests exercise the complete internal path:
 Nginx :80 -> Gunicorn :6000 -> Flask -> trained model
 ```
 
-### 9. Call the public API from Windows
+The application does not define a `/` route, so requesting `http://127.0.0.1/` returns `404 Not Found`. Use `/health` or `/predict` explicitly.
+
+### 9. Call the public API
 
 Confirm that the EC2 security group permits inbound **HTTP (TCP 80)**. For private testing, restrict the source to your public IP. Use `0.0.0.0/0` only when the API is intentionally public.
+
+From EC2 or another Linux client:
+
+```bash
+curl -X POST http://<PUBLIC_IP>/predict -H "Content-Type: application/json" -d '{"text":"I want to cancel my subscription"}'
+```
 
 PowerShell:
 
@@ -227,3 +237,185 @@ python model/train.py
 ### Nginx returns `404 Not Found` for `/predict`
 
 Confirm that `/etc/nginx/conf.d/intent_app.conf` uses `proxy_pass http://127.0.0.1:6000;` without `/predict` after the port. Validate the file with `sudo nginx -t`, then run `sudo systemctl reload nginx`.
+
+### The root URL `/` returns `404 Not Found`
+
+This is expected because Flask does not define a root endpoint. Send health checks to `GET /health` and classification requests to `POST /predict`.
+
+## Auto Scaling and ALB deployment failure: root cause and fixes
+
+The first Auto Scaling deployment failed because several independent problems occurred. The immediate cause of the original `502 Bad Gateway` was a temporary `503 Service Unavailable` response from the Ubuntu package mirror. The package installation failed, `set -e` stopped the user-data script, and neither Gunicorn nor Nginx was configured. The Application Load Balancer therefore had no working application server.
+
+The complete set of problems and fixes was:
+
+| Problem | Effect | Fix |
+| --- | --- | --- |
+| Ubuntu package mirror returned `503` | User data stopped during package installation | Add `Acquire::Retries=5` to both APT commands |
+| Old user data cloned the instructor's default branch | The instance could receive an older deployment script | Clone this fork's `virtual-machines` branch explicitly |
+| Launch template used `intent-classifier-key.pem` | Auto Scaling rejected the launch template because that key-pair name did not exist | Use the AWS key-pair name `intent-classifier-key`; `.pem` is only the local filename |
+| Nginx used `proxy_pass http://127.0.0.1:6000/predict;` | Request paths were rewritten and `/health` could not be forwarded correctly | Use `proxy_pass http://127.0.0.1:6000;` |
+| Target group checked the wrong URL | Target reported `Target.ResponseCodeMismatch` | Configure the health-check path as `/health` with expected code `200` |
+
+The course script may work when the Ubuntu mirror responds normally. Adding retries makes it more resilient, while the other changes correct separate repository, AWS, and routing configuration issues.
+
+### Diagnose a failed user-data launch
+
+Get the instance ID from the Auto Scaling Group:
+
+```bash
+export INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names "$ASG_NAME" \
+  --query 'AutoScalingGroups[0].Instances[0].InstanceId' \
+  --output text \
+  --region "$AWS_REGION")
+echo "$INSTANCE_ID"
+```
+
+Connect to the instance and inspect cloud-init. Replace `<PUBLIC_IP>` with the instance's public IP:
+
+```bash
+ssh -i ~/intent-classifier-key.pem ubuntu@<PUBLIC_IP>
+sudo cloud-init status --long
+sudo tail -n 100 /var/log/cloud-init-output.log
+sudo systemctl status intent_gunicorn nginx --no-pager
+```
+
+If cloud-init reports `scripts_user` failed and the log ends with an APT `503`, package installation stopped before the services were created. The committed `userdata.sh` now retries temporary APT failures.
+
+### Create a corrected launch-template version
+
+Run these commands from the repository in CloudShell. AWS uses the key-pair name without the `.pem` extension:
+
+```bash
+export AWS_REGION="ap-southeast-1"
+export LAUNCH_TEMPLATE_NAME="mlops-template"
+export ASG_NAME="mlops-autoscaling"
+export KEY_NAME="intent-classifier-key"
+
+aws ec2 describe-key-pairs --key-names "$KEY_NAME" --region "$AWS_REGION"
+bash -n userdata.sh
+USER_DATA=$(base64 -w0 userdata.sh)
+```
+
+Create a version based on the current default and override its user data and key-pair name:
+
+```bash
+export LT_VERSION=$(aws ec2 create-launch-template-version \
+  --launch-template-name "$LAUNCH_TEMPLATE_NAME" \
+  --source-version '$Default' \
+  --version-description "reliable-userdata-and-correct-key" \
+  --launch-template-data "{\"KeyName\":\"$KEY_NAME\",\"UserData\":\"$USER_DATA\"}" \
+  --query 'LaunchTemplateVersion.VersionNumber' \
+  --output text \
+  --region "$AWS_REGION")
+echo "$LT_VERSION"
+```
+
+Decode and inspect the stored user data before launching anything:
+
+```bash
+aws ec2 describe-launch-template-versions \
+  --launch-template-name "$LAUNCH_TEMPLATE_NAME" \
+  --versions "$LT_VERSION" \
+  --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
+  --output text \
+  --region "$AWS_REGION" | base64 -d | grep -E 'apt-get|git clone|proxy_pass'
+```
+
+The output should contain the APT retries, the `victorjongsoon` repository with the `virtual-machines` branch, and `proxy_pass http://127.0.0.1:6000;`.
+
+Set the corrected version as the default and update the Auto Scaling Group. Do not start an instance refresh if the ASG update returns an error.
+
+```bash
+aws ec2 modify-launch-template \
+  --launch-template-name "$LAUNCH_TEMPLATE_NAME" \
+  --default-version "$LT_VERSION" \
+  --region "$AWS_REGION"
+
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name "$ASG_NAME" \
+  --launch-template "LaunchTemplateName=$LAUNCH_TEMPLATE_NAME,Version=$LT_VERSION" \
+  --region "$AWS_REGION"
+```
+
+Verify that the ASG references the corrected version:
+
+```bash
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names "$ASG_NAME" \
+  --query 'AutoScalingGroups[0].LaunchTemplate' \
+  --output table \
+  --region "$AWS_REGION"
+```
+
+### Replace old instances safely
+
+Start a rolling instance refresh only after the launch-template update succeeds:
+
+```bash
+export REFRESH_ID=$(aws autoscaling start-instance-refresh \
+  --auto-scaling-group-name "$ASG_NAME" \
+  --strategy Rolling \
+  --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":300}' \
+  --query 'InstanceRefreshId' \
+  --output text \
+  --region "$AWS_REGION")
+echo "$REFRESH_ID"
+```
+
+Monitor it until the status is `Successful` and the percentage is `100`:
+
+```bash
+aws autoscaling describe-instance-refreshes \
+  --auto-scaling-group-name "$ASG_NAME" \
+  --instance-refresh-ids "$REFRESH_ID" \
+  --query 'InstanceRefreshes[0].{Status:Status,Percentage:PercentageComplete,Reason:StatusReason}' \
+  --output table \
+  --region "$AWS_REGION"
+```
+
+### Correct and verify the target-group health check
+
+Inspect the current health-check settings:
+
+```bash
+aws elbv2 describe-target-groups \
+  --target-group-arns "$TARGET_GROUP_ARN" \
+  --query 'TargetGroups[0].{Path:HealthCheckPath,Port:HealthCheckPort,Protocol:HealthCheckProtocol,Expected:Matcher.HttpCode}' \
+  --output table \
+  --region "$AWS_REGION"
+```
+
+The path must be `/health`, the port should be `traffic-port`, and the expected HTTP code should be `200`. Correct it if necessary:
+
+```bash
+aws elbv2 modify-target-group \
+  --target-group-arn "$TARGET_GROUP_ARN" \
+  --health-check-protocol HTTP \
+  --health-check-port traffic-port \
+  --health-check-path /health \
+  --matcher HttpCode=200 \
+  --region "$AWS_REGION"
+```
+
+Check target health until the new instance reports `healthy`:
+
+```bash
+aws elbv2 describe-target-health \
+  --target-group-arn "$TARGET_GROUP_ARN" \
+  --query 'TargetHealthDescriptions[].{Instance:Target.Id,State:TargetHealth.State,Reason:TargetHealth.Reason,Description:TargetHealth.Description}' \
+  --output table \
+  --region "$AWS_REGION"
+```
+
+Finally, test through the ALB from Windows Command Prompt:
+
+```cmd
+curl.exe -X POST "http://<ALB_DNS>/predict" -H "Content-Type: application/json" -d "{\"text\":\"I want to cancel my subscription\"}"
+```
+
+Expected response:
+
+```json
+{"intent":"complaint"}
+```
