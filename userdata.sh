@@ -10,24 +10,37 @@
 # Nginx -> Linux systemd service
 # Enable services
 
-set -e
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Run this script as root: sudo ./userdata.sh"
+  exit 1
+fi
 
 export APP_DIR=/opt/intent-app
-mkdir -p $APP_DIR
-cd $APP_DIR
 
 apt update -y
 apt install -y git python3 python3-venv python3-pip nginx
 
-git clone https://github.com/iam-veeramalla/Intent-classifier-model.git .
+if [ -d "$APP_DIR/.git" ]; then
+  git -c safe.directory="$APP_DIR" -C "$APP_DIR" remote set-url origin https://github.com/victorjongsoon/Intent-classifier-model.git
+  git -c safe.directory="$APP_DIR" -C "$APP_DIR" fetch origin virtual-machines
+  git -c safe.directory="$APP_DIR" -C "$APP_DIR" switch virtual-machines
+  git -c safe.directory="$APP_DIR" -C "$APP_DIR" pull --ff-only origin virtual-machines
+else
+  mkdir -p "$APP_DIR"
+  git clone --branch virtual-machines --single-branch https://github.com/victorjongsoon/Intent-classifier-model.git "$APP_DIR"
+fi
+
+cd "$APP_DIR"
 
 python3 -m venv .venv
 source .venv/bin/activate
-pip install --upgrade pip
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 
-python3 -m pip install -r requirements.txt
-
-python3 model/train.py
+python model/train.py
+chown -R ubuntu:ubuntu "$APP_DIR"
 
 # Configure Gunicorn systemd service
 cat >/etc/systemd/system/intent_gunicorn.service <<'EOF'
@@ -54,7 +67,7 @@ server {
     server_name _;
 
     location / {
-        proxy_pass http://127.0.0.1:6000/predict;
+        proxy_pass http://127.0.0.1:6000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -72,6 +85,7 @@ fi
 # start & enable services
 systemctl daemon-reload
 systemctl enable intent_gunicorn
-systemctl start intent_gunicorn
+systemctl restart intent_gunicorn
+nginx -t
 systemctl enable nginx
 systemctl restart nginx

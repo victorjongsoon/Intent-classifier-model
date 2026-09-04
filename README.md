@@ -34,7 +34,7 @@ The following walkthrough uses an Ubuntu EC2 instance, a Windows computer, and t
 4. Select an official **Ubuntu Server LTS** AMI with the `64-bit (x86)` architecture.
 5. Select an instance type such as `t3.micro`.
 6. Create or select an RSA key pair. Select the `.pem` private-key format and download the key. This guide uses `intent-classifier-key.pem`.
-7. In the security group, allow inbound **SSH (TCP 22)** from **My IP**. Do not expose SSH to `0.0.0.0/0` unless it is temporarily required.
+7. In the security group, allow inbound **SSH (TCP 22)** from **My IP** and **HTTP (TCP 80)** from your IP for private testing or `0.0.0.0/0` for an intentionally public API. Do not expose SSH to `0.0.0.0/0` unless it is temporarily required.
 8. Keep the default storage or adjust it as needed, then select **Launch instance**.
 9. Wait until the instance state is **Running** and its status checks pass.
 10. Copy the instance's **Public IPv4 address**. It is referenced below as `<PUBLIC_IP>`.
@@ -95,57 +95,61 @@ git fetch origin
 git switch --track origin/virtual-machines
 ```
 
-### 5. Install Python and create a virtual environment
+### 5. Run the deployment script
+
+`userdata.sh` performs the production setup: it installs system packages, deploys the `virtual-machines` branch to `/opt/intent-app`, creates the Python virtual environment, installs dependencies, trains the model, and configures Gunicorn and Nginx as systemd services.
+
+Make the script executable and run it as root:
 
 ```bash
-sudo apt update
-sudo apt install -y git python3 python3-venv python3-pip
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+chmod 700 userdata.sh
+sudo ./userdata.sh
 ```
 
-The prompt should now start with `(.venv)`. If Ubuntu requests a version-specific package, install the package named in the error—for example:
+Do not run `sudo userdata.sh`; the current directory is not normally in root's command search path. Use `sudo ./userdata.sh` or `sudo bash userdata.sh`.
+
+The script is safe to run again. If `/opt/intent-app` already contains the repository, it fetches and fast-forwards the `virtual-machines` branch before reinstalling and restarting the services.
+
+### 6. Verify the systemd services
 
 ```bash
-sudo apt install -y python3.14-venv
-python3 -m venv --clear .venv
-source .venv/bin/activate
+systemctl status intent_gunicorn --no-pager
+systemctl status nginx --no-pager
 ```
 
-### 6. Train the model
+Both services should show `active (running)`. The Gunicorn service is enabled at boot and runs three workers on the private loopback address `127.0.0.1:6000`.
+
+Useful service commands:
 
 ```bash
-python model/train.py
+sudo systemctl restart intent_gunicorn
+sudo systemctl reload nginx
+sudo journalctl -u intent_gunicorn -n 50 --no-pager
 ```
 
-The command should print `trained`. Confirm that the generated artifact exists:
+### 7. Verify the Nginx reverse proxy
+
+Inspect and validate the active configuration:
 
 ```bash
-ls -l model/artifacts/intent_model.pkl
+cat /etc/nginx/conf.d/intent_app.conf
+sudo nginx -t
 ```
 
-The model artifact is generated locally and intentionally excluded from Git.
+The proxy target must not contain an endpoint path:
 
-### 7. Start Gunicorn
-
-```bash
-gunicorn --workers 3 --bind 127.0.0.1:6000 wsgi:app
+```nginx
+proxy_pass http://127.0.0.1:6000;
 ```
 
-Gunicorn should report that it is listening at `http://127.0.0.1:6000` and that three workers have booted. Keep this SSH window open while testing. Press `Ctrl+C` when you want to stop Gunicorn.
+This preserves `/health` and `/predict` when Nginx forwards requests to Gunicorn. Using `http://127.0.0.1:6000/predict` here causes `/predict` requests to be rewritten incorrectly and return `404 Not Found`.
 
-`wsgi:app` tells Gunicorn to load the `app` object from `wsgi.py`. Binding to `127.0.0.1` keeps port 6000 private to the EC2 instance.
+### 8. Call the API through Nginx from EC2
 
-### 8. Call the API from the EC2 instance
-
-Open a second PowerShell window, connect to the instance again using SSH, and run the following commands inside the EC2 session.
-
-Check the health endpoint:
+Check the health endpoint on port 80:
 
 ```bash
-curl http://127.0.0.1:6000/health
+curl http://127.0.0.1/health
 ```
 
 Expected response:
@@ -157,7 +161,7 @@ Expected response:
 Classify a complaint:
 
 ```bash
-curl -X POST http://127.0.0.1:6000/predict -H "Content-Type: application/json" -d '{"text":"I want to cancel my subscription"}'
+curl -X POST http://127.0.0.1/predict -H "Content-Type: application/json" -d '{"text":"I want to cancel my subscription"}'
 ```
 
 Expected response:
@@ -169,7 +173,7 @@ Expected response:
 Classify a greeting:
 
 ```bash
-curl -X POST http://127.0.0.1:6000/predict -H "Content-Type: application/json" -d '{"text":"Hi, Whats up"}'
+curl -X POST http://127.0.0.1/predict -H "Content-Type: application/json" -d '{"text":"Hi, Whats up"}'
 ```
 
 Expected response:
@@ -178,25 +182,29 @@ Expected response:
 {"intent":"greeting"}
 ```
 
-### 9. Optional: call the private API from Windows through SSH
+These requests exercise the complete internal path:
 
-An SSH tunnel lets Windows reach Gunicorn without opening port 6000 in the EC2 security group. Keep Gunicorn running, then open another PowerShell window in the key directory:
-
-```powershell
-ssh -i .\intent-classifier-key.pem -L 6000:127.0.0.1:6000 ubuntu@<PUBLIC_IP>
+```text
+Nginx :80 -> Gunicorn :6000 -> Flask -> trained model
 ```
 
-While that SSH connection remains open, use another PowerShell window to call the API:
+### 9. Call the public API from Windows
+
+Confirm that the EC2 security group permits inbound **HTTP (TCP 80)**. For private testing, restrict the source to your public IP. Use `0.0.0.0/0` only when the API is intentionally public.
+
+PowerShell:
 
 ```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:6000/predict" -Method Post -ContentType "application/json" -Body '{"text":"I want to cancel my subscription"}'
+Invoke-RestMethod -Uri "http://<PUBLIC_IP>/predict" -Method Post -ContentType "application/json" -Body '{"text":"I want to cancel my subscription"}'
 ```
 
-Command Prompt equivalent:
+Command Prompt:
 
 ```cmd
-curl.exe -X POST http://127.0.0.1:6000/predict -H "Content-Type: application/json" -d "{\"text\":\"I want to cancel my subscription\"}"
+curl.exe -X POST http://<PUBLIC_IP>/predict -H "Content-Type: application/json" -d "{\"text\":\"I want to cancel my subscription\"}"
 ```
+
+Port `80` is implied by `http://`. Do not expose Gunicorn's port `6000` in the security group; only Nginx needs to reach it locally.
 
 ## Troubleshooting
 
@@ -216,6 +224,6 @@ Train the model before starting Flask or Gunicorn:
 python model/train.py
 ```
 
-### Gunicorn works only while SSH is open
+### Nginx returns `404 Not Found` for `/predict`
 
-This walkthrough runs Gunicorn in the foreground for verification. The next production step is to configure Gunicorn as a `systemd` service and place Nginx in front of it on port 80 or 443.
+Confirm that `/etc/nginx/conf.d/intent_app.conf` uses `proxy_pass http://127.0.0.1:6000;` without `/predict` after the port. Validate the file with `sudo nginx -t`, then run `sudo systemctl reload nginx`.
