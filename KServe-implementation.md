@@ -1,4 +1,4 @@
-# Kserve Demonstration for Iris model
+# KServe demonstration for Iris and text intent models
 
 ### Install Cert Manager
 
@@ -55,15 +55,45 @@ EOF
 kubectl get inferenceservice intent-classifier -n intent
 ```
 
-### Port-forward to access the model
+### Deploy and check the text intent model (v2)
 
+From the project directory, apply the v2 manifest:
+
+```cmd
+kubectl apply -n intent -f intent-classifier-v2.yaml
+kubectl get isvc -n intent
+kubectl get pods -n intent
+kubectl get svc -n intent
 ```
-kubectl -n intent port-forward svc/<svc-name> 8080:80
+
+Both inference services should show `READY=True`, and their predictor pods should be running. These models use the `intent` namespace; querying `ml` will not list them.
+
+### Port-forward to access both models
+
+Open two separate Command Prompt windows and leave each command running. Use a different local port for each model.
+
+Window 1 — Iris model:
+
+```cmd
+kubectl port-forward -n intent svc/intent-classifier-predictor 8080:80
 ```
+
+Window 2 — text intent model:
+
+```cmd
+kubectl port-forward -n intent svc/intent-classifier-v2-predictor 8081:80
+```
+
+| Model | Local port | Input |
+| --- | --- | --- |
+| `intent-classifier` | `8080` | Four Iris measurements |
+| `intent-classifier-v2` | `8081` | Text |
 
 ### Run inference using Windows Command Prompt (cmd.exe)
 
-Keep the port-forward command running, then open another Windows Command Prompt window and run:
+Keep both port-forward windows open, then use a third Command Prompt window for the inference commands.
+
+Iris model:
 
 ```cmd
 curl -s -X POST http://localhost:8080/v1/models/intent-classifier:predict ^
@@ -87,3 +117,33 @@ Expected response for this example:
 
 This Iris model accepts four numeric features per instance: sepal length, sepal width, petal length, and petal width. The returned value `1` is the predicted class index.
 
+Text intent model (v2):
+
+```cmd
+curl -s http://localhost:8081/v1/models/intent-classifier-v2:predict ^
+  -H "Content-Type: application/json" ^
+  -d "{\"instances\":[\"I want to cancel my subscription\"]}"
+```
+
+Or on one line:
+
+```cmd
+curl -s http://localhost:8081/v1/models/intent-classifier-v2:predict -H "Content-Type: application/json" -d "{\"instances\":[\"I want to cancel my subscription\"]}"
+```
+
+Observed response for this example:
+
+```json
+{"predictions":["complaint"]}
+```
+
+With `-d`, curl automatically uses POST, so `-X POST` is optional. Replace `-s` with `-v` to inspect the HTTP request and response status.
+
+Run each command separately. Do not append a `kubectl` command after the curl JSON payload.
+
+### Troubleshooting port-forwarding
+
+- **`unknown command "port-foward"`:** Use the spelling `port-forward` and include `-n intent`.
+- **`Unable to listen on port 8080`:** Another process is using that local port. If the existing Iris port-forward works, keep using it. To restart it, press Ctrl+C in its original window before running it again. Alternatively, use `8082:80` and send Iris requests to `localhost:8082`.
+- **`Model with name intent-classifier does not exist.`:** Check which service the requested local port forwards to. Use port `8080` with `intent-classifier` and port `8081` with `intent-classifier-v2` for the setup above. Switching port `8080` to the v2 service changes which model it reaches.
+- **`Handling connection for 8080` or `8081`:** This is normal output when a request reaches the port-forward session.
