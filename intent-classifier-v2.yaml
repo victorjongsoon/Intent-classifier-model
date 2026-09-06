@@ -1,0 +1,17 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: intent-classifier-v2
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: sklearn
+      storageUri: "https://github.com/victorjongsoon/Intent-classifier-model/releases/download/1.0/intent_model.pkl"
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "512Mi"
+        limits:
+          cpu: "1"
+          memory: "1Gi"
